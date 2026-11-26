@@ -212,6 +212,18 @@ test_ubuntu() {
       echo "  ✓ /usr/bin/$pkg verified executable"
     done
 
+    echo "--- Checking that apt treats the installed packages as up to date ---"
+    # apt reinstalls a package on every upgrade when the index and the .deb control disagree.
+    upgrade_plan="$(apt-get -s upgrade)"
+    for pkg in '"$apt_install_pkgs"'; do
+      if grep -q "^Inst $pkg " <<<"$upgrade_plan"; then
+        echo "Error: apt wants to reinstall $pkg right after installing it; the Packages index does not match its control file:" >&2
+        grep "^Inst $pkg " <<<"$upgrade_plan" >&2
+        exit 1
+      fi
+    done
+    echo "  ✓ no installed package is offered as an upgrade"
+
     echo "=== Ubuntu 26.04 (APT) verification and installation passed! ==="
   '
 }
@@ -257,6 +269,18 @@ test_debian() {
       [[ -x "/usr/bin/$pkg" ]] || { echo "Error: Binary /usr/bin/$pkg not found or not executable after installation!" >&2; exit 1; }
       echo "  ✓ /usr/bin/$pkg verified executable"
     done
+    echo "--- Checking that apt treats the installed packages as up to date ---"
+    # apt reinstalls a package on every upgrade when the index and the .deb control disagree.
+    upgrade_plan="$(apt-get -s upgrade)"
+    for pkg in '"$apt_install_pkgs"'; do
+      if grep -q "^Inst $pkg " <<<"$upgrade_plan"; then
+        echo "Error: apt wants to reinstall $pkg right after installing it; the Packages index does not match its control file:" >&2
+        grep "^Inst $pkg " <<<"$upgrade_plan" >&2
+        exit 1
+      fi
+    done
+    echo "  ✓ no installed package is offered as an upgrade"
+
     echo "=== Debian (APT) verification and installation passed! ==="
   '
 }

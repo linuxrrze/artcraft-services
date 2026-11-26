@@ -1,6 +1,6 @@
 import { ARTCRAFT_STUDIO_RELEASE, artcraftStudioDownloads } from "./artcraft-studio";
 import { createHash } from "node:crypto";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { unstable_cache } from "next/cache";
 import {
   CRAFTING_APPS,
@@ -46,6 +46,8 @@ export type LinuxPackageAssetMeta = {
   depends?: string[];
   provides?: string[];
   optdepends?: string[];
+  /** A .deb's own `control` file, which dpkg records verbatim when it installs the package. */
+  debControl?: string;
 };
 
 export type LinuxRepoApp = {
@@ -59,6 +61,15 @@ export type LinuxRepoApp = {
     filename: string;
     size: number;
     sha256: string;
+    /**
+     * The package's own `control` file. The APT index repeats it unchanged: apt only treats the
+     * installed package and the repository entry as the same build when their Version,
+     * Installed-Size and relationship fields match byte for byte, so anything written here
+     * independently makes apt reinstall the same version on every upgrade.
+     */
+    control: string;
+    /** `Version` from the control file, which may differ from the release version (e.g. no `-1`). */
+    version: string;
     depends: string;
     recommends?: string;
     installedSize: number;
@@ -660,6 +671,180 @@ async function fetchArchPackageInfo(downloadUrl: string, filename: string): Prom
 }
 
 /**
+ * A .deb is an ar archive whose first members are `debian-binary` and `control.tar[.gz|.zst]`,
+ * a few KB together, so one small Range request normally covers the control file.
+ */
+const DEB_CONTROL_PROBE_BYTES = 64 * 1024;
+/** A control member beyond this is not a real package; stop instead of downloading it. */
+const DEB_CONTROL_MAX_BYTES = 16 * 1024 * 1024;
+
+export type DebControlScan = { control: string } | { needBytes: number };
+
+/**
+ * Reads the `control` file from the start of a .deb. When `buf` ends before the control member
+ * does, returns how many leading bytes of the package are needed instead.
+ */
+export async function readDebControl(buf: Uint8Array, filename = "package"): Promise<DebControlScan> {
+  const data = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (data.length < 8) {
+    return { needBytes: DEB_CONTROL_PROBE_BYTES };
+  }
+  if (data.toString("latin1", 0, 8) !== "!<arch>\n") {
+    throw new Error(`${filename} is not a Debian package`);
+  }
+
+  let offset = 8;
+  while (offset + 60 <= data.length) {
+    const name = data.toString("latin1", offset, offset + 16).trim().replace(/\/$/, "");
+    const size = Number(data.toString("latin1", offset + 48, offset + 58).trim());
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new Error(`${filename} has a malformed ar member header`);
+    }
+    const start = offset + 60;
+    const end = start + size;
+
+    if (name.startsWith("control.tar")) {
+      if (end > data.length) {
+        return { needBytes: end };
+      }
+      const member = data.subarray(start, end);
+      let tar: Buffer;
+      if (name === "control.tar") {
+        tar = member;
+      } else if (name === "control.tar.gz") {
+        tar = gunzipSync(member);
+      } else if (name === "control.tar.zst") {
+        const { decompress } = await import("fzstd");
+        tar = Buffer.from(decompress(member));
+      } else {
+        throw new Error(`${filename} uses an unsupported control archive (${name})`);
+      }
+      const control = readTarFile(tar, "control");
+      if (control === null) {
+        throw new Error(`${filename} has no control file in ${name}`);
+      }
+      return { control };
+    }
+    if (name === "data.tar" || name.startsWith("data.tar.")) {
+      throw new Error(`${filename} has no control archive before its data archive`);
+    }
+
+    offset = end + (size % 2);
+  }
+
+  return { needBytes: offset + 60 };
+}
+
+/** Returns a regular file's text from an uncompressed tar archive, or null when it is absent. */
+function readTarFile(tar: Buffer, wanted: string): string | null {
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    const name = header.toString("utf-8", 0, 100).replace(/\0[\s\S]*$/, "");
+    if (!name) {
+      return null;
+    }
+    const size = Number.parseInt(header.toString("latin1", 124, 136).replace(/[\0 ]+$/, "").trim(), 8) || 0;
+    const type = header.toString("latin1", 156, 157);
+    const start = offset + 512;
+    if (name.replace(/^\.\//, "") === wanted && (type === "0" || type === "\0")) {
+      return tar.toString("utf-8", start, start + size);
+    }
+    offset = start + Math.ceil(size / 512) * 512;
+  }
+  return null;
+}
+
+/**
+ * Splits the first stanza of a control file into fields, in order. A continuation line (one that
+ * starts with a space or tab, as in a long Description) stays part of its field's value.
+ */
+export function parseDebControl(text: string): Array<[string, string]> {
+  const fields: Array<[string, string]> = [];
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    if (!line.trim()) {
+      if (fields.length) break;
+      continue;
+    }
+    if (/^[ \t]/.test(line)) {
+      if (!fields.length) {
+        throw new Error(`Malformed control file: continuation line before any field: ${line}`);
+      }
+      fields[fields.length - 1][1] += `\n${line}`;
+      continue;
+    }
+    const colon = line.indexOf(":");
+    if (colon <= 0) {
+      throw new Error(`Malformed control file line: ${line}`);
+    }
+    fields.push([line.slice(0, colon).trim(), line.slice(colon + 1).trim()]);
+  }
+  return fields;
+}
+
+function debControlField(fields: Array<[string, string]>, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  return fields.find(([field]) => field.toLowerCase() === lower)?.[1];
+}
+
+/**
+ * Fetches the first `bytes` bytes of a package, retrying like fetchHeadPackageSize. Also returns
+ * the package's full size when the response states it.
+ */
+async function fetchPackagePrefix(
+  downloadUrl: string,
+  filename: string,
+  bytes: number,
+): Promise<{ data: Uint8Array; totalSize: number }> {
+  const attempts = 3;
+  let lastError: Error = new Error(`Unable to read ${filename}`);
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const res = await fetch(downloadUrl, {
+        headers: { Range: `bytes=0-${bytes - 1}` },
+        redirect: "follow",
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (res.ok) {
+        const data = new Uint8Array(await res.arrayBuffer());
+        const rangeTotal = Number(res.headers.get("content-range")?.match(/\/(\d+)$/)?.[1]);
+        // A server that ignores Range sends the whole package with a 200.
+        const totalSize = res.status === 200 ? data.length : (Number.isSafeInteger(rangeTotal) ? rangeTotal : 0);
+        return { data, totalSize };
+      }
+      lastError = new Error(`Unable to read ${filename}: HTTP ${res.status}`);
+    } catch (error) {
+      lastError = error instanceof Error ? error : lastError;
+    }
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Reads a .deb's size and its `control` file with Range requests, without downloading the
+ * package. Throws when the control file cannot be read: an index entry guessed instead would
+ * make apt reinstall the package forever, which is worse than failing the build.
+ */
+async function fetchDebPackageInfo(downloadUrl: string, filename: string): Promise<{ size: number; control: string }> {
+  let want = DEB_CONTROL_PROBE_BYTES;
+  for (;;) {
+    const { data, totalSize } = await fetchPackagePrefix(downloadUrl, filename, want);
+    const scan = await readDebControl(data, filename);
+    if ("control" in scan) {
+      const size = totalSize || await fetchHeadPackageSize(downloadUrl, filename);
+      return { size, control: scan.control };
+    }
+    if (scan.needBytes <= data.length || scan.needBytes > DEB_CONTROL_MAX_BYTES) {
+      throw new Error(`Unable to read the control file of ${filename}`);
+    }
+    want = scan.needBytes;
+  }
+}
+
+/**
  * Fetches and validates the SHA-256 digest from SHA256SUMS.txt.
  */
 async function fetchValidatedSha256(
@@ -678,7 +863,8 @@ async function fetchValidatedSha256(
 
 /**
  * Reads metadata (size, SHA-256 digest, installed size) for a package asset straight from
- * GitHub: its SHA256SUMS.txt entry, plus a Range probe into the package for .PKGINFO.
+ * GitHub: its SHA256SUMS.txt entry, plus a Range probe into the package for .PKGINFO (Arch) or
+ * the control file (Debian).
  */
 type ComputedPackageMetadata = LinuxPackageAssetMeta & { estimated?: boolean };
 
@@ -701,9 +887,19 @@ async function computePackageMetadata(
     return { sha256, ...archInfo };
   }
 
+  if (filename.endsWith(".deb")) {
+    const { size, control } = await fetchDebPackageInfo(downloadUrl, filename);
+    const installedSize = Number(debControlField(parseDebControl(control), "Installed-Size"));
+    return {
+      size,
+      sha256,
+      installedSize: Number.isSafeInteger(installedSize) ? installedSize : 0,
+      debControl: control,
+    };
+  }
+
   const size = await fetchHeadPackageSize(downloadUrl, filename);
-  const divisor = filename.endsWith(".deb") ? 1024 : 1;
-  const installedSize = Math.round(size * 1.95 / divisor);
+  const installedSize = Math.round(size * 1.95);
 
   return { size, sha256, installedSize };
 }
@@ -733,7 +929,7 @@ const durablePackageMetadata = unstable_cache(
     }
     return metadata;
   },
-  ["linux-package-metadata"],
+  ["linux-package-metadata-v2"],
   { revalidate: 60 * 60 * 24 },
 );
 
@@ -793,6 +989,7 @@ async function buildDebAssets(
   name: string,
   repo: string,
   version: string,
+  packageName: string,
   tagOverride?: string,
 ): Promise<LinuxRepoApp["debAssets"]> {
   const debArchMap: DebArchMapItem[] = [
@@ -804,38 +1001,48 @@ async function buildDebAssets(
   const sums = await getShaSums(repo, version, tagOverride);
   const candidates = debArchMap.filter(({ fileArch }) => sums.has(`${name}-${version}-linux-${fileArch}.deb`));
 
-  const baseName = name.replace(/-nightly$/, "");
-  const baseDepends = "libc6 (>= 2.35), libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libvulkan1 | libegl1";
-  const defaultDepends = AUDIO_APPS.has(baseName)
-    ? `${baseDepends}, libasound2 | libasound2t64`
-    : baseDepends;
-  const defaultRecommends = "mesa-vulkan-drivers, libegl-mesa0, xdg-desktop-portal";
-
   const results = await Promise.all(
     candidates.map(async ({ debArch, fileArch }) => {
       const filename = `${name}-${version}-linux-${fileArch}.deb`;
       const meta = await getLinuxPackageMetadata(filename, repo, version, tagOverride);
-      const glibcVer = debArch === "riscv64" ? "2.39" : "2.35";
-      let depends = defaultDepends;
-      if (baseName === "artcraft") {
-        depends = `libc6 (>= ${glibcVer}), libgcc-s1, libgtk-3-0, libwebkit2gtk-4.1-0, libssl3`;
-      } else if (baseName === "artcraft-launcher" && debArch === "riscv64") {
-        depends = "libc6 (>= 2.39), libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libvulkan1 | libegl1";
+      if (!meta.debControl) {
+        throw new Error(`No control file was read for ${filename}`);
+      }
+      const fields = parseDebControl(meta.debControl);
+      const controlPackage = debControlField(fields, "Package");
+      const controlArch = debControlField(fields, "Architecture");
+      const controlVersion = debControlField(fields, "Version");
+      // apt would ask for one package and dpkg install another: leave it out rather than break apt.
+      if (controlPackage !== packageName || (controlArch !== debArch && controlArch !== "all") || !controlVersion) {
+        if (!reportedMismatchedDebs.has(filename)) {
+          reportedMismatchedDebs.add(filename);
+          console.warn(
+            `Withholding ${filename}: its control file says Package ${controlPackage ?? "(none)"}, ` +
+              `Architecture ${controlArch ?? "(none)"}, Version ${controlVersion ?? "(none)"}; ` +
+              `the repository lists it as ${packageName} for ${debArch}`,
+          );
+        }
+        return null;
       }
       return {
         arch: debArch,
         filename,
         size: meta.size,
         sha256: meta.sha256,
-        depends,
-        recommends: defaultRecommends,
+        control: meta.debControl,
+        version: controlVersion,
+        depends: debControlField(fields, "Depends") ?? "",
+        recommends: debControlField(fields, "Recommends"),
         installedSize: meta.installedSize,
       };
     })
   );
 
-  return results;
+  return results.filter((asset) => asset !== null);
 }
+
+/** Each withheld package is worth reporting once; catalog builds repeat on every request. */
+const reportedMismatchedDebs = new Set<string>();
 
 /**
  * Once the repository requires signatures, it must not advertise a package no client can verify:
@@ -966,7 +1173,7 @@ export async function getLinuxRepoApps(formats?: RepoFormatFilter): Promise<Linu
     appPromises.push((async () => {
       const version = ARTCRAFT_STUDIO_RELEASE.version;
       const [debAssets, rpmAssets, archAssets] = await Promise.all([
-        includeDeb ? buildDebAssets("artcraft", "artcraft", version) : Promise.resolve([]),
+        includeDeb ? buildDebAssets("artcraft", "artcraft", version, "artcraft") : Promise.resolve([]),
         includeRpm ? buildRpmAssets("artcraft", "artcraft", version) : Promise.resolve([]),
         includeArch ? buildArchAssets("artcraft", "artcraft", version) : Promise.resolve([]),
       ]);
@@ -980,7 +1187,7 @@ export async function getLinuxRepoApps(formats?: RepoFormatFilter): Promise<Linu
     if (CRAFT_LAUNCHER_RELEASE) {
       appPromises.push((async () => {
         const [debAssets, rpmAssets, archAssets] = await Promise.all([
-          includeDeb ? buildDebAssets("artcraft-launcher", "craft-launcher", CRAFT_LAUNCHER_RELEASE.version) : Promise.resolve([]),
+          includeDeb ? buildDebAssets("artcraft-launcher", "craft-launcher", CRAFT_LAUNCHER_RELEASE.version, "artcraft-launcher") : Promise.resolve([]),
           includeRpm ? buildRpmAssets("artcraft-launcher", "craft-launcher", CRAFT_LAUNCHER_RELEASE.version) : Promise.resolve([]),
           includeArch ? buildArchAssets("artcraft-launcher", "craft-launcher", CRAFT_LAUNCHER_RELEASE.version) : Promise.resolve([]),
         ]);
@@ -1007,7 +1214,7 @@ export async function getLinuxRepoApps(formats?: RepoFormatFilter): Promise<Linu
 
       appPromises.push((async () => {
         const [debAssets, rpmAssets, archAssets] = await Promise.all([
-          includeDeb ? buildDebAssets(app.slug, app.slug, release.version) : Promise.resolve([]),
+          includeDeb ? buildDebAssets(app.slug, app.slug, release.version, app.slug) : Promise.resolve([]),
           includeRpm ? buildRpmAssets(app.slug, app.slug, release.version) : Promise.resolve([]),
           includeArch ? buildArchAssets(app.slug, app.slug, release.version) : Promise.resolve([]),
         ]);
@@ -1032,7 +1239,7 @@ export async function getLinuxRepoApps(formats?: RepoFormatFilter): Promise<Linu
       const assetPrefix = nightly.version.includes("-nightly") ? nightly.baseName : nightly.packageName;
       appPromises.push((async () => {
         const [debAssets, rpmAssets, archAssets] = await Promise.all([
-          includeDeb ? buildDebAssets(assetPrefix, nightly.repo, nightly.version, nightly.tag) : Promise.resolve([]),
+          includeDeb ? buildDebAssets(assetPrefix, nightly.repo, nightly.version, nightly.packageName, nightly.tag) : Promise.resolve([]),
           includeRpm ? buildRpmAssets(assetPrefix, nightly.repo, nightly.version, nightly.tag) : Promise.resolve([]),
           includeArch ? buildArchAssets(assetPrefix, nightly.repo, nightly.version, nightly.tag) : Promise.resolve([]),
         ]);
@@ -1107,36 +1314,48 @@ export async function handleAptPackagesRoute(
   });
 }
 
+/** Fields the index adds for each package; a control file has no business setting them. */
+const APT_INDEX_ONLY_FIELDS = new Set(["filename", "size", "md5sum", "sha1", "sha256", "sha512"]);
+
+/**
+ * Writes one stanza per package the way dpkg-scanpackages does: the package's own control file,
+ * unchanged, plus where to download it and its checksum. Fields the package leaves out are filled
+ * in from the site's catalog; none of them are part of what apt compares with the installed
+ * package, so they cannot make apt treat the two as different builds.
+ */
 export async function generateAptPackages(arch: string): Promise<string> {
-  const lines: string[] = [];
+  const stanzas: string[] = [];
   const apps = await getLinuxRepoApps({ deb: true });
 
   for (const app of apps) {
     const asset = app.debAssets.find((a) => a.arch === arch);
     if (!asset) continue;
 
-    const packageLines = [
-      `Package: ${app.name}`,
-      `Version: ${app.version}-1`,
-      `Section: ${app.section}`,
-      "Priority: optional",
-      `Architecture: ${asset.arch}`,
-      `Maintainer: ${app.name} maintainers <hello@storyteller.ai>`,
-      `Installed-Size: ${asset.installedSize}`,
-      `Depends: ${asset.depends}`,
-      ...(asset.recommends ? [`Recommends: ${asset.recommends}`] : []),
-      `Homepage: https://getartcraft.com/apps/${app.slug}`,
-      `Filename: pool/main/${app.slug}/${asset.filename}`,
-      `Size: ${asset.size}`,
-      `SHA256: ${asset.sha256}`,
-      `Description: ${app.description}`,
-      "",
+    const control = parseDebControl(asset.control)
+      .filter(([field]) => !APT_INDEX_ONLY_FIELDS.has(field.toLowerCase()));
+    const has = (name: string) => debControlField(control, name) !== undefined;
+
+    const fallbacks: Array<[string, string]> = [];
+    if (!has("Section")) fallbacks.push(["Section", app.section]);
+    if (!has("Priority")) fallbacks.push(["Priority", "optional"]);
+    if (!has("Maintainer")) fallbacks.push(["Maintainer", `${app.name} maintainers <hello@storyteller.ai>`]);
+    if (!has("Homepage")) fallbacks.push(["Homepage", `https://getartcraft.com/apps/${app.slug}`]);
+
+    const description = control.find(([field]) => field.toLowerCase() === "description")
+      ?? ["Description", app.description];
+    const fields: Array<[string, string]> = [
+      ...control.filter(([field]) => field.toLowerCase() !== "description"),
+      ...fallbacks,
+      ["Filename", `pool/main/${app.slug}/${asset.filename}`],
+      ["Size", String(asset.size)],
+      ["SHA256", asset.sha256],
+      description,
     ];
 
-    lines.push(...packageLines);
+    stanzas.push(`${fields.map(([field, value]) => `${field}: ${value}`).join("\n")}\n`);
   }
 
-  return lines.join("\n");
+  return stanzas.map((stanza) => `${stanza}\n`).join("");
 }
 
 export async function generateAptRelease(date: Date = APT_REPO_DATE): Promise<string> {

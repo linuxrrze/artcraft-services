@@ -8,6 +8,7 @@ import {
   resetLinuxRepoCachesForTests,
   resolvePackageDownloadUrl,
 } from "../src/lib/linux-repos";
+import { buildFakeDeb, serveDeb } from "./fixtures/fake-deb";
 
 test("Studio Linux catalog matches every package target and keeps all three platforms on the same version", () => {
   expect(DOWNLOAD_VERSIONS.WINDOWS).toBe(ARTCRAFT_STUDIO_RELEASE.version);
@@ -37,12 +38,21 @@ test("Studio APT and RPM repositories use the ArtCraft tag and WebKit dependenci
   const requests: string[] = [];
   const files = ["x86_64", "aarch64", "riscv64"].flatMap((arch) =>
     ["deb", "rpm", "rpm.asc", "pkg.tar.zst", "pkg.tar.zst.sig"].map((format) => `artcraft-0.41.1-linux-${arch}.${format}`));
-  globalThis.fetch = async (input) => {
+  const debArch: Record<string, string> = { x86_64: "amd64", aarch64: "arm64", riscv64: "riscv64" };
+  globalThis.fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
     requests.push(url);
     if (url.endsWith("SHA256SUMS.txt")) {
       return new Response(url.includes("/artcraft/releases/")
         ? files.map((file) => `${"ab".repeat(32)}  ${file}`).join("\n") : "");
+    }
+    const debMatch = url.match(/\/artcraft-0\.41\.1-linux-(\w+)\.deb$/);
+    if (debMatch) {
+      const glibc = debMatch[1] === "riscv64" ? "2.39" : "2.35";
+      return serveDeb(buildFakeDeb(
+        `Package: artcraft\nVersion: 0.41.1\nArchitecture: ${debArch[debMatch[1]]}\nInstalled-Size: 87457\n` +
+          `Depends: libc6 (>= ${glibc}), libwebkit2gtk-4.1-0, libgtk-3-0\nDescription: ArtCraft\n`,
+      ), init);
     }
     return new Response(null, { headers: { "Content-Length": "4096" } });
   };
@@ -53,6 +63,8 @@ test("Studio APT and RPM repositories use the ArtCraft tag and WebKit dependenci
     expect(studio!.debAssets).toHaveLength(3);
     expect(studio!.debAssets.every((asset) => asset.depends.includes("libwebkit2gtk-4.1-0"))).toBeTruthy();
     expect(studio!.debAssets.find((asset) => asset.arch === "riscv64")!.depends).toContain("2.39");
+    // The index carries the package's own Version, which for Studio has no Debian revision.
+    expect(studio!.debAssets.every((asset) => asset.version === "0.41.1")).toBeTruthy();
     expect(studio!.archAssets).toHaveLength(2);
     const pacmanDesc = generatePacmanDesc(studio!, studio!.archAssets[0]);
     expect(pacmanDesc).toContain("%NAME%\nai.artcraft.app\n");

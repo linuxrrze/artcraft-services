@@ -39,10 +39,11 @@ switch (mode) {
 
   case "apt-checksums": {
     // sha256 checksum file content for sha256sum -c
-    // apt-get download stores files as <name>_<version>-1_<arch>.deb
+    // apt-get download stores files as <name>_<version>_<arch>.deb, with the Version from the
+    // package's control file (an epoch's ":" is written as "%3a")
     const lines = LINUX_REPO_APPS.flatMap((app) =>
       app.debAssets.map((asset) => {
-        const debFilename = `${app.name}_${app.version}-1_${asset.arch}.deb`;
+        const debFilename = `${app.name}_${asset.version.replaceAll(":", "%3a")}_${asset.arch}.deb`;
         return `${asset.sha256}  ${debFilename}`;
       })
     );

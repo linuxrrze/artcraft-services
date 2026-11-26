@@ -27,7 +27,10 @@ import {
   getRequestBaseUrl,
   buildTar,
   createPkgInfoScanner,
+  parseDebControl,
+  readDebControl,
 } from "../src/lib/linux-repos";
+import { buildFakeDeb, serveDeb } from "./fixtures/fake-deb";
 import * as openpgp from "openpgp";
 import { createHash } from "node:crypto";
 import { getSigningPublicKey, isRepoSigningConfigured, normalizeArmoredKey, signCleartext, signDetachedArmored, signDetachedBinary } from "../src/lib/repo-signing";
@@ -352,7 +355,9 @@ test.describe("Linux Package Repositories (APT, RPM & Pacman)", () => {
     expect(anicraftApp?.archAssets).toHaveLength(2);
     const studioApp = apps.find((app) => app.slug === "artcraft");
     expect(studioApp).toBeDefined();
-    expect(studioApp?.debAssets).toHaveLength(3);
+    // Studio 0.41.1's .deb files declare `Package: art-craft`, so they are withheld from the APT
+    // index until a release packages them as `artcraft`; any that are listed must say so.
+    expect(studioApp?.debAssets.every((asset) => /^Package: artcraft$/m.test(asset.control))).toBeTruthy();
     expect(studioApp?.rpmAssets).toHaveLength(3);
     expect(studioApp?.archAssets).toHaveLength(2);
     const pdfcraftApp = apps.find((app) => app.slug === "pdfcraft");
@@ -761,6 +766,10 @@ test.describe("signed repositories", () => {
     const shaRpm = "2".repeat(64);
     const shaArch = "3".repeat(64);
     const realFetch = globalThis.fetch;
+    const deb = buildFakeDeb(
+      `Package: photocraft-nightly\nVersion: ${version}-1\nArchitecture: amd64\nInstalled-Size: 4321\n` +
+        "Depends: libc6 (>= 2.35)\nDescription: PhotoCraft nightly\n",
+    );
 
     CRAFT_NIGHTLY_RELEASES.photocraft = { tag, version };
     resetLinuxRepoCachesForTests();
@@ -771,6 +780,9 @@ test.describe("signed repositories", () => {
           `${shaDeb}  ${debName}\n${shaRpm}  ${rpmName}\n${shaRpm}  ${rpmName}.asc\n${shaArch}  ${archName}\n${shaArch}  ${archName}.sig\n`,
           { status: 200 },
         );
+      }
+      if (url.endsWith(debName)) {
+        return serveDeb(deb, init);
       }
       if (url.includes(`/releases/download/${tag}/`) && init?.method === "HEAD") {
         return new Response(null, { status: 200, headers: { "content-length": "123456" } });
@@ -807,5 +819,117 @@ test.describe("signed repositories", () => {
       delete CRAFT_NIGHTLY_RELEASES.photocraft;
       resetLinuxRepoCachesForTests();
     }
+  });
+});
+
+test.describe("APT index from the .deb control file", () => {
+  const control = [
+    "Package: photocraft-nightly",
+    "Version: 0.24.0~nightly.20261123",
+    "Architecture: amd64",
+    "Maintainer: PhotoCraft maintainers <photocraft@storyteller.ai>",
+    "Installed-Size: 265653",
+    "Depends: libc6 (>= 2.35), libgcc-s1, libvulkan1 | libegl1",
+    "Recommends: mesa-vulkan-drivers, xdg-desktop-portal",
+    "Description: PhotoCraft photo editor",
+    " A longer description,",
+    " .",
+    " over several lines.",
+    "",
+  ].join("\n");
+
+  test("readDebControl reads gzip and uncompressed control archives", async () => {
+    for (const compression of ["gz", "none"] as const) {
+      const scan = await readDebControl(buildFakeDeb(control, { compression }));
+      expect(scan).toEqual({ control });
+    }
+  });
+
+  test("readDebControl asks for more bytes when the control archive is cut off", async () => {
+    const deb = buildFakeDeb(control, { compression: "none", extraControlFiles: { md5sums: "x".repeat(100_000) } });
+    const scan = await readDebControl(deb.subarray(0, 64 * 1024));
+    expect("needBytes" in scan && scan.needBytes).toBeGreaterThan(64 * 1024);
+    expect(await readDebControl(deb.subarray(0, "needBytes" in scan ? scan.needBytes : 0))).toEqual({ control });
+  });
+
+  test("readDebControl rejects files that are not Debian packages", async () => {
+    await expect(readDebControl(Buffer.from("not an ar archive"))).rejects.toThrow("not a Debian package");
+  });
+
+  test("parseDebControl keeps continuation lines with their field", () => {
+    const fields = parseDebControl(control);
+    expect(fields.map(([field]) => field)).toEqual([
+      "Package", "Version", "Architecture", "Maintainer", "Installed-Size", "Depends", "Recommends", "Description",
+    ]);
+    expect(fields.at(-1)?.[1]).toBe("PhotoCraft photo editor\n A longer description,\n .\n over several lines.");
+  });
+
+  async function withNightlyDeb<T>(controlText: string, run: () => Promise<T>, debOptions = {}): Promise<T> {
+    const tag = "nightly-20261123-abcdef";
+    const version = "0.24.0~nightly.20261123";
+    const debName = `photocraft-nightly-${version}-linux-x86_64.deb`;
+    const deb = buildFakeDeb(controlText, debOptions);
+    const sha = createHash("sha256").update(deb).digest("hex");
+    const realFetch = globalThis.fetch;
+    CRAFT_NIGHTLY_RELEASES.photocraft = { tag, version };
+    resetLinuxRepoCachesForTests();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes(`/releases/download/${tag}/SHA256SUMS.txt`)) {
+        return new Response(`${sha}  ${debName}\n`, { status: 200 });
+      }
+      if (url.endsWith(debName)) {
+        return serveDeb(deb, init);
+      }
+      return realFetch(input, init);
+    }) as typeof fetch;
+    try {
+      return await run();
+    } finally {
+      globalThis.fetch = realFetch;
+      delete CRAFT_NIGHTLY_RELEASES.photocraft;
+      resetLinuxRepoCachesForTests();
+    }
+  }
+
+  function nightlyStanza(packages: string): string {
+    return packages.split("\n\n").find((stanza) => stanza.startsWith("Package: photocraft-nightly\n")) ?? "";
+  }
+
+  test("repeats the control file verbatim and adds only download fields and fallbacks", async () => {
+    await withNightlyDeb(control, async () => {
+      const stanza = nightlyStanza(await generateAptPackages("amd64"));
+      expect(stanza).toContain("Version: 0.24.0~nightly.20261123\n");
+      expect(stanza).not.toContain("Version: 0.24.0~nightly.20261123-1");
+      expect(stanza).toContain("Maintainer: PhotoCraft maintainers <photocraft@storyteller.ai>\n");
+      expect(stanza).toContain("Installed-Size: 265653\n");
+      expect(stanza).toContain("Depends: libc6 (>= 2.35), libgcc-s1, libvulkan1 | libegl1\n");
+      expect(stanza).toContain("Recommends: mesa-vulkan-drivers, xdg-desktop-portal\n");
+      // Missing from the package, so filled in from the catalog.
+      expect(stanza).toContain("Section: graphics\n");
+      expect(stanza).toContain("Priority: optional\n");
+      expect(stanza).toContain("Homepage: https://getartcraft.com/apps/photocraft\n");
+      expect(stanza).toMatch(/\nFilename: pool\/main\/photocraft\/photocraft-nightly-0\.24\.0~nightly\.20261123-linux-x86_64\.deb\n/);
+      expect(stanza).toMatch(/\nSize: \d+\n/);
+      expect(stanza).toMatch(/\nSHA256: [0-9a-f]{64}\n/);
+      expect(stanza).toContain("Description: PhotoCraft photo editor\n A longer description,\n .\n over several lines.");
+
+      const apps = await getLinuxRepoApps({ deb: true });
+      const asset = apps.find((app) => app.name === "photocraft-nightly")?.debAssets[0];
+      expect(asset?.version).toBe("0.24.0~nightly.20261123");
+      expect(asset?.installedSize).toBe(265653);
+    });
+  });
+
+  test("reads a control archive that does not fit in the first Range request", async () => {
+    await withNightlyDeb(control, async () => {
+      expect(nightlyStanza(await generateAptPackages("amd64"))).toContain("Installed-Size: 265653\n");
+    }, { compression: "none", extraControlFiles: { md5sums: "x".repeat(100_000) } });
+  });
+
+  test("withholds a package whose control file names a different package", async () => {
+    await withNightlyDeb(control.replace("Package: photocraft-nightly", "Package: photocraft"), async () => {
+      expect(nightlyStanza(await generateAptPackages("amd64"))).toBe("");
+    });
   });
 });
